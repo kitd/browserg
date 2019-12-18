@@ -1,0 +1,831 @@
+<!--
+========================================================================================================
+    B R O W S E R G
+========================================================================================================
+
+    An in-browser monitor for Concept2 ergometers that is entirely self-contained and requires no internet
+    connection to operate.
+
+    Uses the Web Audio APIs to analyse signals from a C2 pick-up cable connected to a mic socket or
+    other audio input. Requires a modern standards-based browser, probably not IE.
+
+    The following resources were extremely helpful:
+    1. Anu Dudhia, The Physics of Rowing (erg section) - http://eodg.atm.ox.ac.uk/user/dudhia/rowing/physics/ergometer.html
+    2. Marinus van Holst - http://home.hccnet.nl/m.holst/ErgoDisp.pdf
+
+    My grateful thanks to the authors.
+
+    This file may be redistributed for any purpose, including commercial purposes, as long as credit is
+    given to 'BrowsErg' in the documentation accompanying the redistribution. 
+
+    © Copyright Kit Davies 2019
+-->
+<!doctype html>
+<head>
+<title>BrowsErg</title>
+
+<!--
+========================================================================================================
+        S T Y L I N G
+========================================================================================================
+-->
+<style>
+    body {
+        background-color: black;
+        color: white;
+        font-family: sans-serif;
+    }
+    .numbers {
+        font-size: 48px;
+        font-style: italic;
+        font-weight: bold;
+        text-align: right;
+        padding-right: 15px;
+        height: 55px;
+        text-shadow: 3px 3px gray;
+    }
+    .text {
+        font-size: 32px;
+    }
+    .dragFactor {
+        font-size: 16px;
+    }
+    table {
+        width: 100%;
+        border-collapse: collapse;
+    }
+    td {
+        width: 33%;
+        border-bottom: 1px solid #444;
+    }
+    h1 {
+        background-color: white;
+        color: black;
+        text-align: center;
+        text-shadow: 3px 3px gray;
+        line-height: 55px;
+    }
+    .btn {
+        color: white; 
+        background: gray; 
+        border: 2px solid #0099CC;
+        border-radius: 6px; 
+        border: none;      
+        padding: 16px 32px;      
+        text-align: center;      
+        display: inline-block;      
+        font-size: 24px;      
+        margin: 4px 2px;      
+     }
+
+</style>
+</head>
+
+<body>
+<!--
+========================================================================================================
+        D I S P L A Y
+========================================================================================================
+-->
+    <h1>BrowsErg</h1>
+
+    <table>
+        <tr>
+            <td class="text">Time</td><td class="numbers"><span id="time">0:00</span></td><td class="text"></td>
+        </tr>
+        <tr>
+            <td class="text">Distance</td><td class="numbers"><span id="dist">0</span></td><td class="text">m</td>
+        </tr>
+        <tr>
+            <td class="text">Rate</td><td class="numbers"><span id="rate">0</span></td><td class="text">spm</td>
+        </tr>
+        <tr>
+            <td class="text">Power</td><td class="numbers"><span id="power">0</span></td><td class="text">watts</td>
+        </tr>
+        <tr>
+            <td class="text">Split</td><td class="numbers"><span id="split">0:00</span></td><td class="text">/500m</td>
+        </tr>
+        <tr>
+            <td class="text">Stroke distance</td><td class="numbers"><span id="strokeDist">0</span></td><td class="text">m/stroke</td>
+        </tr>
+        <tr>
+            <td></td><td></td><td class="dragFactor">Drag factor <span id="dragFactor">0</span></td>
+        </tr>
+    </table>
+    <button class="btn" id="startStop">Start</button><br><br>Test mode <input type="checkbox" id="testing" checked>
+     
+
+<!--
+========================================================================================================
+        C O D E
+========================================================================================================
+-->
+<script type="text/javascript">
+
+// Browser compatibility hacks
+window.requestAnimFrame = (function(){
+    return  window.requestAnimationFrame       || 
+      window.webkitRequestAnimationFrame || 
+      window.mozRequestAnimationFrame    || 
+      window.oRequestAnimationFrame      || 
+      window.msRequestAnimationFrame     || 
+      function( callback ){
+      window.setTimeout(callback, 1000 / 60);
+    };
+    })();
+
+navigator.getUserMedia = (
+    navigator.getUserMedia ||
+    navigator.getUserMedia ||
+    navigator.webkitGetUserMedia ||
+    navigator.mozGetUserMedia ||
+    navigator.msGetUserMedia
+);
+
+var context = null,
+    source, 
+    analyser,
+    sampleInterval = 50,
+    testing = true,
+    testRower,
+    testStrokeProfile = [50.0, 60.0, 65.0, 60.0, 55.0, 50.0];
+
+// Signal analyser
+function createAnalyser(source, pollInterval, onStrokeEnd) {
+
+    var analyserNode = new AnalyserNode(context, {fftSize: 4096}),
+        poller,
+        timer,
+        lastPollAt = context.currentTime,
+        fftBins = new Uint8Array(analyserNode.frequencyBinCount),
+        prevOmega = 0.0,
+        peakOmega = 0.0,
+        isDrive = false,
+        driveEndedAt = lastPollAt,
+        lastDriveEndedAt = driveEndedAt,
+        rate = 0,
+        powers = [],
+        dragFactor = 0.00002,
+        moi = 0.1001,
+        timeStart = -1,
+        time = 0.0,
+        dist = 0.0,
+        lastDist = 0.0;
+
+    // In which we poll and analyse the incoming frequencies.
+    var poll = function() {
+        var pollTime = context.currentTime; // Double precision secs since start of sampling
+        var interval = pollTime - lastPollAt;
+
+        // Read the current wave profile. Each 'bin' is 1 / sample-rate secs. Amplitude range is 0-255
+        analyserNode.getByteTimeDomainData(fftBins);
+        var startBin = -1,
+            endBin = 0;
+        // Find the first and second signal wave midpoints (ie amp value 127 or 128)
+        // The distance between them is a half cycle
+        for (var i=0; i<fftBins.length; i++) {
+            // Look for either 127 or 128 as neither are guaranteed to be present
+            if (fftBins[i] == 128 || fftBins[i] == 127) { 
+                if (startBin == -1) {
+                    startBin = i;
+                }
+                else {
+                    endBin = i;
+                    break;
+                }
+                // Ignore subsequent 127s & 128s
+                for (i++; i<fftBins.length && (fftBins[i] == 128 || fftBins[i] == 127); i++) {}
+            }          
+        }
+
+        
+        var halfCycle = endBin - startBin;
+        console.log(halfCycle);
+        // No signal coming through. Assume flywheel not turning so skip the rest.
+        if (halfCycle == 0) { 
+            lastPollAt = pollTime;
+            return;
+        }
+
+        // Frequency of signals in Hz = sample rate / (2 * half cycle)
+        var freq = context.sampleRate / (halfCycle * 2);
+
+        // There are 3 magnets on the flywheel, and 2*Pi radians in a rotation,
+        // so angular velocity = (freq / 3) * 2*Pi
+        var omega = (freq / 3) * 2 * Math.PI;
+
+        // If the timer has started, update distance and time.
+        if (timeStart > -1) {
+            var rads = omega * interval;
+            dist += Math.pow(dragFactor / 2.8, 0.333333) * rads;
+            time = pollTime - timeStart;
+        }
+
+        // Angular acceleration = rate of change in angular vel;
+        var accel = (omega - prevOmega) / interval;
+
+        // Torque = angular accel * moment of inertia
+        var torque = accel * moi;
+
+        // Net power = (torque * angular vel) + (drag factor * angular vel ^ 3) 
+        var power = (torque * omega) + (dragFactor * Math.pow(omega, 3));
+        powers.push(power);
+
+        if (isDrive) {
+            if (omega <= prevOmega) {
+                // Drive phase ended. Record time and peak angular vel.
+                isDrive = false
+                driveEndedAt = lastPollAt;
+                peakOmega = prevOmega;
+
+                // Calculate the figures needed to update the display
+                var state = {
+                    dragFactor: dragFactor,
+                    strokeDist: dist - lastDist
+                };
+
+                lastDist = dist;
+
+                // Calculate mean power
+                var totalPower = 0.0;
+                for (var i=0; i<powers.length; i++) {
+                    totalPower += powers[i]; 
+                }
+                state.meanPower = totalPower/powers.length;
+                powers.splice(0);
+
+                // Calculate rate
+                state.rate = Math.round(60 / (driveEndedAt - lastDriveEndedAt));
+                lastDriveEndedAt = driveEndedAt;
+
+                // Call callback to update display
+                if (onStrokeEnd != null) {
+                    setTimeout(onStrokeEnd, 10, state);
+                }
+           } 
+        }
+
+        else {
+            if (omega > prevOmega) {
+                // Drive phase starting. 
+                isDrive = true;
+                // If the timer has not yet started, we need to start it.
+                if (timeStart == -1) {
+                    timeStart = lastPollAt;
+                }
+                // Calculate new drag factor from total deceleration during recovery. 
+                if (peakOmega > 0 && prevOmega > 0) {
+                    recoveryTime = lastPollAt - driveEndedAt;
+                    dragFactor = -1 * (((1/peakOmega) - (1/prevOmega)) / recoveryTime) * moi; 
+                }
+            }
+        }
+
+        prevOmega = omega;
+        lastPollAt = pollTime;
+    };
+
+    source.connect(analyserNode);
+
+    return {
+        start: () => {
+            poller = setInterval(poll, pollInterval); // requestAnimationFrame(poll); 
+            timer = setInterval(function() { updateTimeDist(time, dist); }, 1000); // requestAnimationFrame(poll); 
+        },
+        stop: () => {
+             clearInterval(poller); //cancelAnimationFrame(poller) 
+             clearInterval(timer);
+        }
+    };
+}
+
+// Update timer & distance on display
+function updateTimeDist(time, dist) {
+    var mins = Math.floor(time/60); 
+    var secs = Math.round(time - (mins * 60)); 
+    document.getElementById("time").innerText = "" + mins + ":" + (secs < 10 ? "0":"") + secs;
+    document.getElementById("dist").innerText = Math.round(dist);
+}
+
+// Update display. Called at the end of each stroke.
+function updateDisplay(state) {
+    document.getElementById("rate").innerText = state.rate;
+    document.getElementById("power").innerText = isNaN(state.meanPower) ? "--" : Math.round(state.meanPower*10) / 10;
+    document.getElementById("dragFactor").innerText = isNaN(state.dragFactor) ? "--" : Math.round(state.dragFactor * 100000)/ 100000;
+
+    if (isNaN(state.meanPower)) {
+        document.getElementById("split").innerText = "--:--";
+    }
+    else {
+        var pace = Math.pow(2.8/state.meanPower, 0.3333333) * 500;
+        var mins = Math.floor(pace/60); 
+        var secs = Math.round((pace - (mins * 60))*10) / 10; 
+        document.getElementById("split").innerText = "" + mins + ":" + (secs < 10 ? "0":"") + secs;
+    }
+    document.getElementById("strokeDist").innerText = Math.round(state.strokeDist);
+}
+
+// Start/stop button handler
+document.getElementById('startStop').addEventListener('click', function() {
+    if (context == null) {
+        context = new (window.AudioContext || window.webkitAudioContext)();
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    }
+
+    if (this.innerText == "Start") {
+        if (!testing) {
+            navigator.getUserMedia(
+                {audio: true},
+                (function(stream) { 
+                    source = context.createMediaStreamSource(stream);
+                    var filter = new BiquadFilterNode(context, {type:'lowpass', frequency:300});
+                    source.connect(filter);
+                    analyser = createAnalyser(filter, sampleInterval, updateDisplay);
+                    context.resume();
+                    analyser.start();
+                    this.innerText = "Stop";
+                }).bind(this),
+                function() { 
+                    alert("Unable to open audio input. Please check input/mic settings."); 
+                }
+            );
+        }
+        else {
+            source = new OscillatorNode(context, {type: 'sine', frequency: testStrokeProfile[0]});
+            analyser = createAnalyser(source, sampleInterval, updateDisplay);
+            context.resume();
+            source.start();
+            source.frequency.setValueCurveAtTime(testStrokeProfile, context.currentTime, 2.95);
+            testRower = setInterval(()=>{
+                source.frequency.setValueCurveAtTime(testStrokeProfile, context.currentTime, 2.95);
+            }, 3000);
+            analyser.start();
+            this.innerText = "Stop";
+        }
+    }
+
+    else {
+        analyser.stop();
+        context.suspend();
+        if (source.stop) {
+            clearInterval(testRower);
+            source.frequency.cancelScheduledValues(context.currentTime);
+            source.stop();
+        }
+        this.innerText = "Start";
+    }
+});
+
+document.getElementById('testing').addEventListener('click', function() { testing = this.checked; });
+
+</script>
+  </body>
+
+</html>
